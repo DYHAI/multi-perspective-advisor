@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>多视角人生参谋 · Multi-Perspective Advisor</title>
+<meta name="app-version" content="__VER__" />
+<link rel="stylesheet" href="/static/style.css?v=__VER__" />
+</head>
+<body>
+<div class="aurora" aria-hidden="true"><i></i><i></i><i></i></div>
+
+<header class="topbar">
+  <div class="brand">
+    <div class="mark">◍</div>
+    <div class="brand-text">
+      <h1>多视角人生参谋</h1>
+      <p>多个大模型 × 不同视角圆桌讨论，再由总分析师收敛成一份结论</p>
+    </div>
+  </div>
+  <div class="top-actions">
+    <span id="key-status" class="pill ok">硅基流动 · 已就绪</span>
+  </div>
+</header>
+
+<main class="layout">
+
+  <!-- ============ 左：输入 ============ -->
+  <section class="col-left">
+
+    <div class="card input-card">
+      <div class="card-head">
+        <h2>你的三件事</h2>
+        <span class="hint">三项都可以只填一部分，留空也能出结果</span>
+      </div>
+      <div class="field" data-field="encounter">
+        <div class="field-head">
+          <span class="tag t1">遭遇</span>
+          <span class="field-desc">过往与当下：发生了什么、你现在处在什么状态</span>
+        </div>
+        <textarea id="in-encounter" rows="5"
+          placeholder="例如：去年从待了五年的公司离职，本想休息两个月，结果一直没找到方向。现在靠存款生活，白天刷招聘网站，晚上睡不着……"></textarea>
+        <div class="field-foot"><span class="fill-flag"></span><span class="counter">0 字</span></div>
+      </div>
+
+      <div class="field" data-field="problem">
+        <div class="field-head">
+          <span class="tag t2">问题</span>
+          <span class="field-desc">你现在最想解决的那个问题</span>
+        </div>
+        <textarea id="in-problem" rows="4"
+          placeholder="例如：不知道该回到原行业，还是彻底转行；越拖越不敢投简历。"></textarea>
+        <div class="field-foot"><span class="fill-flag"></span><span class="counter">0 字</span></div>
+      </div>
+
+      <div class="field" data-field="expectation">
+        <div class="field-head">
+          <span class="tag t3">期待</span>
+          <span class="field-desc">未来你希望变成什么样</span>
+        </div>
+        <textarea id="in-expectation" rows="4"
+          placeholder="例如：半年内有一份我不排斥、能稳定做下去的工作，晚上能睡得着，不再每天自我否定。"></textarea>
+        <div class="field-foot"><span class="fill-flag"></span><span class="counter">0 字</span></div>
+      </div>
+
+      <div class="optional-row">
+        <label class="switch">
+          <input type="checkbox" id="opt-deep" />
+          <span class="slider"></span>
+          <span class="switch-text">深度模式 · 圆桌第二轮<em>（各模型看到彼此观点后互相补充／反驳，费用与时间约翻倍）</em></span>
+        </label>
+        <div class="inline-opt">
+          <span>最终建议条数</span>
+          <select id="opt-suggestions" class="select tiny">
+            <option value="3">3 条</option>
+            <option value="4" selected>4 条</option>
+            <option value="5">5 条</option>
+          </select>
+          <span class="hint">每条含「为什么 / 怎么做 / 风险与代价」</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card model-card">
+      <div class="card-head">
+        <h2>本局阵容</h2>
+        <span class="hint" id="model-count"></span>
+      </div>
+      <p class="mini-note" id="round-note">每次运行都从模型池里随机抽 12 个模型，各配一个不同的角色 —— 你不需要挑选。</p>
+      <div id="model-list" class="model-list"></div>
+      <div class="row-actions">
+        <button class="ghost small" id="btn-redraw">🎲 换一批</button>
+      </div>
+      <div id="scale-info" class="scale-info"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>开始</h2>
+        <span class="hint">12 份意见 → 一份最终稿</span>
+      </div>
+      <div class="row-actions">
+        <button class="primary big" id="btn-run">开始圆桌分析</button>
+        <button class="ghost" id="btn-stop" hidden>停止</button>
+      </div>
+      <p class="mini-note center" id="run-note">12 个模型同时作答，再由汇总模型收敛成最终稿，通常 40～60 秒。</p>
+    </div>
+  </section>
+
+  <!-- ============ 右：结果 ============ -->
+  <section class="col-right">
+    <div class="stage-head">
+      <div>
+        <h2>圆桌现场</h2>
+        <p id="stage-sub">还没有开始。填好左边的信息，点「开始圆桌分析」。</p>
+      </div>
+      <div class="stage-actions">
+        <div class="progress" id="progress" hidden><div class="bar"><i></i></div><span id="progress-text">0 / 0</span></div>
+        <button class="ghost small" id="btn-copy" disabled>复制全文</button>
+        <button class="ghost small" id="btn-export" disabled>导出 Markdown</button>
+      </div>
+    </div>
+
+    <div id="stage" class="stage">
+      <div class="empty-state">
+        <div class="empty-orb"></div>
+        <h3>12 个模型，12 个不同角色，认真回答你一件事</h3>
+        <p>理性分析师帮你拆结构，共情陪伴者先接住情绪，风控官替你算最坏情况，<br/>
+          现金流分析师算清钱能撑多久，破局者质疑你的二选一，时机专家判断哪扇窗正在关闭。</p>
+      </div>
+    </div>
+  </section>
+</main>
+
+<div class="toast" id="toast" hidden></div>
+
+<script src="/static/app.js?v=__VER__"></script>
+</body>
+</html>

@@ -1,0 +1,26 @@
+{
+  "active_provider": "siliconflow",
+  "providers": {
+    "siliconflow": {
+      "api_key": "在这里填你的硅基流动 API Key",
+      "base_url": "https://api.siliconflow.cn/v1"
+    }
+  },
+  "default_aggregator": {
+    "provider": "siliconflow",
+    "id": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+    "label": "Qwen3-30B-A3B"
+  },
+  "temperature": 0.85,
+  "language": "中文",
+  "max_tokens": 650,
+  "max_concurrency": 12,
+  "idle_timeout": 40,
+  "hard_timeout": 100,
+  "layered_summary": false,
+  "random_count": 12,
+  "network": {
+    "force_ipv4": true,
+    "proxy": ""
+  }
+}

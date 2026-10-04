@@ -1,0 +1,16 @@
+# 你的 API Key 与分析记录，绝不能进仓库
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# macOS
+.DS_Store
+._*
+
+# 编辑器
+.vscode/
+.idea/
