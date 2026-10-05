@@ -1,0 +1,8 @@
+tunnel: 你的隧道UUID
+credentials-file: /Users/你的用户名/.cloudflared/你的隧道UUID.json
+
+# 这个域名上的所有请求，都转发到本机的「多视角人生参谋」
+ingress:
+  - hostname: mpa.你的域名.com
+    service: http://127.0.0.1:8765
+  - service: http_status:404

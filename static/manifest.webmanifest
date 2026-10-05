@@ -1,0 +1,17 @@
+{
+  "name": "多视角人生参谋",
+  "short_name": "人生参谋",
+  "description": "12 个大模型 × 12 个角色，圆桌讨论后收敛成一份带多视角对照的最终报告",
+  "lang": "zh-CN",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#08070f",
+  "theme_color": "#08070f",
+  "icons": [
+    { "src": "/static/icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/static/icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/static/icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

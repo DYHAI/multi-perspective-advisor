@@ -14,10 +14,15 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
+import html as html_mod
 import mimetypes
 import os
 import queue
+import secrets
 import socket
+import sqlite3
 import sys
 import threading
 import time
@@ -345,6 +350,15 @@ DEFAULT_CONFIG = {
     "hard_timeout": 100,
     "layered_summary": False,
     "random_count": 12,
+    # 暴露到公网前一定要设置密码，否则任何人都能用你的 API Key
+    "access": {"password": "", "secret": ""},
+    # 使用统计与防滥用
+    "stats": {
+        "admin_token": "",          # 后台统计页的访问密钥（留空则首次启动自动生成）
+        "per_visitor_hourly": 10,   # 每个访客每小时最多跑几次
+        "daily_cost_cap": 20.0,     # 每天总花费上限（元），防止被刷爆
+        "record_content": True,     # 是否记录输入与结果内容
+    },
     "network": {"force_ipv4": True, "proxy": ""},
 }
 
@@ -430,6 +444,77 @@ def build_opener(cfg: dict):
 
 
 # --------------------------------------------------------------------------
+# 访问密码：把服务暴露到公网前必须开启，否则任何人都能花你的 API 额度
+# --------------------------------------------------------------------------
+
+COOKIE_NAME = "mpa_auth"
+
+
+def access_config(cfg: dict) -> dict:
+    access = cfg.get("access") or {}
+    if not access.get("secret"):
+        access["secret"] = secrets.token_hex(16)
+        cfg["access"] = access
+        save_config(cfg)
+    return access
+
+
+def auth_token(cfg: dict) -> str:
+    access = access_config(cfg)
+    return hmac.new(access["secret"].encode(), access["password"].encode(), hashlib.sha256).hexdigest()
+
+
+def auth_enabled(cfg: dict) -> bool:
+    return bool(((cfg.get("access") or {}).get("password") or "").strip())
+
+
+LOGIN_PAGE = """<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<title>多视角人生参谋</title>
+<style>
+  :root{color-scheme:dark}
+  body{margin:0;min-height:100vh;display:grid;place-items:center;
+    background:#08070f;color:#eceaf6;font-family:-apple-system,"PingFang SC",sans-serif;
+    padding:24px;padding:calc(24px + env(safe-area-inset-top)) 24px calc(24px + env(safe-area-inset-bottom));}
+  .box{width:100%;max-width:340px;background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.09);
+    border-radius:20px;padding:24px;backdrop-filter:blur(14px)}
+  .orb{width:52px;height:52px;border-radius:50%;margin-bottom:18px;
+    background:conic-gradient(from 0deg,#7c6bff,#ff6fae,#3fd0c2,#7c6bff)}
+  h1{font-size:17px;margin:0 0 6px}
+  p{font-size:12.5px;color:#a49fc0;margin:0 0 18px;line-height:1.7}
+  input{width:100%;box-sizing:border-box;background:rgba(0,0,0,.3);color:#eceaf6;
+    border:1px solid rgba(255,255,255,.12);border-radius:13px;padding:13px 14px;font-size:16px}
+  input:focus{outline:none;border-color:rgba(139,123,255,.6);box-shadow:0 0 0 3px rgba(139,123,255,.15)}
+  button{width:100%;margin-top:12px;padding:14px;border:none;border-radius:13px;font-size:15px;
+    font-weight:600;color:#fff;background:linear-gradient(135deg,#7c6bff,#b06bff 45%,#ff6fae);cursor:pointer}
+  .err{color:#ffb3c4;font-size:12.5px;margin-top:10px;min-height:18px}
+</style></head>
+<body>
+<div class="box">
+  <div class="orb"></div>
+  <h1>多视角人生参谋</h1>
+  <p>这是私人服务，请输入访问密码。</p>
+  <input id="pw" type="password" placeholder="访问密码" autocomplete="current-password"/>
+  <button id="go">进入</button>
+  <div class="err" id="err"></div>
+</div>
+<script>
+  const submit = async () => {
+    const r = await fetch("/api/login", {method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({password: document.getElementById("pw").value})});
+    if (r.ok) { location.href = "/"; }
+    else { document.getElementById("err").textContent = "密码不对，再试一次"; }
+  };
+  document.getElementById("go").onclick = submit;
+  document.getElementById("pw").addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
+</script>
+</body></html>
+"""
+
+
+# --------------------------------------------------------------------------
 # 配置读写
 # --------------------------------------------------------------------------
 
@@ -504,10 +589,411 @@ def public_config(cfg: dict) -> dict:
         "idle_timeout": cfg.get("idle_timeout", 45),
         "hard_timeout": cfg.get("hard_timeout", 150),
         "random_count": cfg.get("random_count", 12),
+        "has_password": auth_enabled(cfg),
         "layered_summary": cfg.get("layered_summary", True),
         "default_lenses": DEFAULT_LENSES,
         "network": cfg.get("network", {"force_ipv4": True, "proxy": ""}),
     }
+
+
+# --------------------------------------------------------------------------
+# 使用统计：谁在用、用了几次、问了什么、最后得出什么结论
+# 数据存在本机 data/stats.db（SQLite，标准库，无额外依赖）
+# --------------------------------------------------------------------------
+
+STATS_DB = DATA_DIR / "stats.db"
+VISITOR_COOKIE = "mpa_vid"
+
+
+def _stats_conn() -> sqlite3.Connection:
+    ensure_dirs()
+    conn = sqlite3.connect(STATS_DB, timeout=15)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_stats_db() -> None:
+    conn = _stats_conn()
+    try:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS visitors (
+            vid TEXT PRIMARY KEY,
+            first_seen TEXT, last_seen TEXT,
+            visits INTEGER DEFAULT 0,
+            runs INTEGER DEFAULT 0,
+            ip TEXT, ua TEXT, last_path TEXT
+        );
+        CREATE TABLE IF NOT EXISTS runs (
+            id TEXT PRIMARY KEY,
+            vid TEXT, created_at TEXT, duration REAL,
+            ip TEXT, ua TEXT, referer TEXT,
+            encounter TEXT, problem TEXT, expectation TEXT,
+            final_text TEXT, reviews_json TEXT, models_json TEXT,
+            cost REAL, status TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_runs_created ON runs(created_at);
+        CREATE INDEX IF NOT EXISTS idx_runs_vid ON runs(vid);
+        CREATE TABLE IF NOT EXISTS visits (
+            vid TEXT, ts TEXT, ip TEXT, ua TEXT, path TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_visits_vid ON visits(vid, ts);
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def now_str() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def touch_visitor(vid: str, ip: str, ua: str, path: str) -> None:
+    """记录一次访问（同一个访客 5 分钟内重复刷新不重复计数）。"""
+    now = now_str()
+    conn = _stats_conn()
+    try:
+        row = conn.execute("SELECT last_seen FROM visitors WHERE vid=?", (vid,)).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE visitors SET last_seen=?, ip=?, ua=?, last_path=? WHERE vid=?",
+                (now, ip, ua, path, vid))
+            recent = conn.execute(
+                "SELECT 1 FROM visits WHERE vid=? AND ts > datetime('now','localtime','-5 minutes') LIMIT 1",
+                (vid,)).fetchone()
+            if not recent:
+                conn.execute("UPDATE visitors SET visits=visits+1 WHERE vid=?", (vid,))
+                conn.execute("INSERT INTO visits(vid, ts, ip, ua, path) VALUES(?,?,?,?,?)",
+                             (vid, now, ip, ua, path))
+        else:
+            conn.execute(
+                "INSERT INTO visitors(vid, first_seen, last_seen, visits, runs, ip, ua, last_path)"
+                " VALUES(?,?,?,?,0,?,?,?)", (vid, now, now, 1, ip, ua, path))
+            conn.execute("INSERT INTO visits(vid, ts, ip, ua, path) VALUES(?,?,?,?,?)",
+                         (vid, now, ip, ua, path))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def runs_last_hour(vid: str) -> int:
+    conn = _stats_conn()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) c FROM runs WHERE vid=? AND created_at > datetime('now','localtime','-1 hour')",
+            (vid,)).fetchone()
+        return int(row["c"] if row else 0)
+    finally:
+        conn.close()
+
+
+def cost_today() -> float:
+    conn = _stats_conn()
+    try:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(cost),0) s FROM runs WHERE created_at >= date('now','localtime')").fetchone()
+        return float(row["s"] if row else 0)
+    finally:
+        conn.close()
+
+
+def record_run(job: "Job", duration: float, status: str) -> None:
+    cfg = job.cfg
+    stats_cfg = cfg.get("stats") or {}
+    keep_content = bool(stats_cfg.get("record_content", True))
+    if keep_content:
+        parts = job.parts or {}
+        enc = parts.get("encounter", "") or ""
+        prob = parts.get("problem", "") or ""
+        exp = parts.get("expectation", "") or ""
+        final_text = job.final_text or ""
+        reviews_json = json.dumps(
+            [{k: r.get(k) for k in ("label", "lens_name", "model", "provider", "text", "phase")}
+             for r in job.results.values()], ensure_ascii=False)
+    else:
+        enc = prob = exp = "[未记录]"
+        final_text = "[未记录]"
+        reviews_json = "[]"
+    conn = _stats_conn()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO runs(id, vid, created_at, duration, ip, ua, referer,"
+            " encounter, problem, expectation, final_text, reviews_json, models_json, cost, status)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (job.id, job.visitor_id or "", job.created_at_str, round(duration, 1),
+             job.client_ip or "", job.client_ua or "", job.client_referer or "",
+             enc, prob, exp, final_text, reviews_json,
+             json.dumps([{k: m.get(k) for k in ("id", "label", "lenses")} for m in (job.models or [])],
+                        ensure_ascii=False),
+             job.cost, status))
+        conn.execute("UPDATE visitors SET runs = runs + 1, last_seen=? WHERE vid=?",
+                     (now_str(), job.visitor_id or ""))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def stats_overview() -> dict:
+    conn = _stats_conn()
+    try:
+        g = lambda sql, *a: conn.execute(sql, a).fetchone()[0]  # noqa: E731
+        return {
+            "visitors": g("SELECT COUNT(*) FROM visitors"),
+            "runs": g("SELECT COUNT(*) FROM runs"),
+            "runs_today": g("SELECT COUNT(*) FROM runs WHERE created_at >= date('now','localtime')"),
+            "visitors_today": g("SELECT COUNT(DISTINCT vid) FROM runs WHERE created_at >= date('now','localtime')"),
+            "cost_total": round(float(g("SELECT COALESCE(SUM(cost),0) FROM runs")), 3),
+            "cost_today": round(cost_today(), 3),
+            "failed": g("SELECT COUNT(*) FROM runs WHERE status != 'done'"),
+        }
+    finally:
+        conn.close()
+
+
+def list_visitors(limit: int = 200) -> list:
+    conn = _stats_conn()
+    try:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM visitors ORDER BY last_seen DESC LIMIT ?", (limit,))]
+    finally:
+        conn.close()
+
+
+def list_runs(limit: int = 200, vid: str | None = None) -> list:
+    conn = _stats_conn()
+    try:
+        if vid:
+            rows = conn.execute("SELECT * FROM runs WHERE vid=? ORDER BY created_at DESC LIMIT ?",
+                                (vid, limit))
+        else:
+            rows = conn.execute("SELECT * FROM runs ORDER BY created_at DESC LIMIT ?", (limit,))
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_run(run_id: str) -> dict | None:
+    conn = _stats_conn()
+    try:
+        row = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def client_ip_of(handler) -> str:
+    """Cloudflare 隧道会把真实访客 IP 放在 CF-Connecting-IP 里。"""
+    for header in ("CF-Connecting-IP", "X-Forwarded-For", "X-Real-IP"):
+        val = handler.headers.get(header)
+        if val:
+            return val.split(",")[0].strip()
+    try:
+        return handler.client_address[0]
+    except Exception:
+        return ""
+
+
+def stats_config(cfg: dict) -> dict:
+    st = cfg.setdefault("stats", {})
+    if not st.get("admin_token"):
+        st["admin_token"] = secrets.token_urlsafe(18)
+        save_config(cfg)
+    return st
+
+
+# --------------------------------------------------------------------------
+# 后台统计页面（服务端渲染，不依赖任何前端框架）
+# --------------------------------------------------------------------------
+
+ADMIN_STYLE = """
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:#08070f;color:#eceaf6;
+  font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.7}
+a{color:#a79bff;text-decoration:none}
+a:hover{text-decoration:underline}
+.wrap{max-width:1180px;margin:0 auto;padding:28px 20px 80px}
+h1{font-size:20px;margin:0 0 4px}
+.sub{color:#8d88a8;font-size:12.5px;margin-bottom:22px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:26px}
+.card{background:rgba(255,255,255,.045);border:1px solid rgba(255,255,255,.09);
+  border-radius:16px;padding:14px 16px}
+.card b{display:block;font-size:24px;font-weight:600;letter-spacing:.5px}
+.card span{font-size:11.5px;color:#8d88a8}
+h2{font-size:15px;margin:30px 0 12px;padding-left:10px;border-left:3px solid #8b7bff}
+table{width:100%;border-collapse:collapse;font-size:13px;
+  background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08);border-radius:14px;overflow:hidden}
+th,td{padding:9px 12px;text-align:left;border-bottom:1px solid rgba(255,255,255,.06);vertical-align:top}
+th{background:rgba(139,123,255,.13);color:#cfc7ff;font-weight:600;font-size:12px;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(255,255,255,.025)}
+.muted{color:#8d88a8}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.tag{display:inline-block;padding:1px 8px;border-radius:7px;font-size:11px;
+  background:rgba(139,123,255,.18);color:#b9aeff;border:1px solid rgba(139,123,255,.3)}
+.tag.ok{background:rgba(79,209,197,.15);color:#8fe6dc;border-color:rgba(79,209,197,.3)}
+.tag.bad{background:rgba(255,122,140,.14);color:#ffb3c4;border-color:rgba(255,122,140,.3)}
+.box{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.08);
+  border-radius:14px;padding:14px 16px;margin-bottom:14px}
+.box h3{margin:0 0 8px;font-size:13px;color:#cfc7ff}
+pre{white-space:pre-wrap;word-break:break-word;margin:0;font-size:13px;
+  font-family:inherit;color:#ddd9f0}
+details{margin-bottom:10px;background:rgba(255,255,255,.03);
+  border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:10px 14px}
+summary{cursor:pointer;font-size:13px;color:#cfc7ff}
+.bar{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:18px}
+.btn{display:inline-block;padding:8px 14px;border-radius:11px;font-size:13px;
+  background:rgba(139,123,255,.16);border:1px solid rgba(139,123,255,.34)}
+.empty{color:#8d88a8;padding:18px;text-align:center}
+"""
+
+
+def short_ua(ua: str) -> str:
+    if not ua:
+        return "未知"
+    device = "电脑"
+    if "iPhone" in ua:
+        device = "iPhone"
+    elif "iPad" in ua:
+        device = "iPad"
+    elif "Android" in ua:
+        device = "Android"
+    elif "Macintosh" in ua:
+        device = "Mac"
+    elif "Windows" in ua:
+        device = "Windows"
+    browser = "浏览器"
+    for key, name in (("Edg", "Edge"), ("Chrome", "Chrome"), ("Safari", "Safari"),
+                      ("Firefox", "Firefox"), ("curl", "curl")):
+        if key in ua:
+            browser = name
+            break
+    return f"{device} · {browser}"
+
+
+def esc(s) -> str:
+    return html_mod.escape(str(s if s is not None else ""))
+
+
+def admin_page(title: str, body: str) -> str:
+    return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{esc(title)}</title><style>{ADMIN_STYLE}</style></head>
+<body><div class="wrap">{body}</div></body></html>"""
+
+
+ADMIN_404 = admin_page("找不到", "<h1>404</h1><p class='sub'>地址不对，或者后台密钥已更换。</p>")
+
+
+def admin_dashboard() -> str:
+    ov = stats_overview()
+    visitors = list_visitors(300)
+    runs = list_runs(200)
+    token = stats_config(load_config())["admin_token"]
+    base = f"/admin/{token}"
+
+    cards = f"""
+    <div class="cards">
+      <div class="card"><b>{ov['visitors']}</b><span>访客总数</span></div>
+      <div class="card"><b>{ov['runs']}</b><span>分析总次数</span></div>
+      <div class="card"><b>{ov['runs_today']}</b><span>今日分析次数</span></div>
+      <div class="card"><b>{ov['visitors_today']}</b><span>今日活跃人数</span></div>
+      <div class="card"><b>￥{ov['cost_today']}</b><span>今日花费</span></div>
+      <div class="card"><b>￥{ov['cost_total']}</b><span>累计花费</span></div>
+      <div class="card"><b>{ov['failed']}</b><span>失败次数</span></div>
+    </div>
+    <div class="bar">
+      <a class="btn" href="{base}/export.csv">导出 CSV（含问答内容）</a>
+      <a class="btn" href="{base}/export.json">导出 JSON</a>
+    </div>"""
+
+    vt = "".join(
+        f"<tr><td class='mono'><a href='{base}/visitor/{esc(v['vid'])}'>{esc(v['vid'])}</a></td>"
+        f"<td class='muted'>{esc(v['first_seen'])}</td>"
+        f"<td class='muted'>{esc(v['last_seen'])}</td>"
+        f"<td>{v['visits']}</td><td>{v['runs']}</td>"
+        f"<td class='mono'>{esc(v['ip'])}</td>"
+        f"<td class='muted'>{esc(short_ua(v['ua'] or ''))}</td></tr>"
+        for v in visitors) or "<tr><td colspan='7' class='empty'>还没有访客</td></tr>"
+
+    def summarize(r: dict) -> str:
+        text = (r["problem"] or r["encounter"] or r["expectation"] or r["final_text"] or "").strip()
+        text = text.replace("\n", " ")
+        return esc(text[:60]) + ("…" if len(text) > 60 else "")
+
+    rt = "".join(
+        f"<tr><td class='muted'>{esc(r['created_at'])}</td>"
+        f"<td class='mono'>{esc(r['vid'])}</td>"
+        f"<td><a href='{base}/run/{esc(r['id'])}'>{summarize(r) or '（无内容）'}</a></td>"
+        f"<td>{r['duration'] if r['duration'] is not None else '-'}s</td>"
+        f"<td>￥{r['cost'] if r['cost'] is not None else '-'}</td>"
+        f"<td><span class='tag {'ok' if r['status'] == 'done' else 'bad'}'>"
+        f"{'完成' if r['status'] == 'done' else esc(r['status'])}</span></td></tr>"
+        for r in runs) or "<tr><td colspan='6' class='empty'>还没有人跑过分析</td></tr>"
+
+    return admin_page("使用统计", f"""
+      <h1>多视角人生参谋 · 使用统计</h1>
+      <div class="sub">数据存在本机 data/stats.db，只有拿着这个网址的人能看到</div>
+      {cards}
+      <h2>访客（{len(visitors)}）</h2>
+      <table><thead><tr><th>访客</th><th>首次访问</th><th>最近访问</th><th>访问次数</th>
+      <th>分析次数</th><th>IP</th><th>设备</th></tr></thead><tbody>{vt}</tbody></table>
+      <h2>最近的分析（{len(runs)}）</h2>
+      <table><thead><tr><th>时间</th><th>访客</th><th>问题</th><th>用时</th><th>花费</th>
+      <th>状态</th></tr></thead><tbody>{rt}</tbody></table>
+    """)
+
+
+def admin_visitor(vid: str) -> str:
+    token = stats_config(load_config())["admin_token"]
+    base = f"/admin/{token}"
+    runs = list_runs(500, vid=vid)
+    rows = "".join(
+        f"<tr><td class='muted'>{esc(r['created_at'])}</td>"
+        f"<td><a href='{base}/run/{esc(r['id'])}'>"
+        f"{esc(((r['problem'] or r['encounter'] or '')[:60]).replace(chr(10), ' '))}</a></td>"
+        f"<td>￥{r['cost']}</td></tr>" for r in runs)
+    return admin_page(f"访客 {vid}", f"""
+      <h1>访客 <span class="mono">{esc(vid)}</span></h1>
+      <div class="sub"><a href="{base}">← 返回总览</a></div>
+      <h2>TA 的分析记录（{len(runs)}）</h2>
+      <table><thead><tr><th>时间</th><th>问题</th><th>花费</th></tr></thead>
+      <tbody>{rows or "<tr><td colspan='3' class='empty'>没有记录</td></tr>"}</tbody></table>
+    """)
+
+
+def admin_run_detail(run: dict) -> str:
+    token = stats_config(load_config())["admin_token"]
+    base = f"/admin/{token}"
+    try:
+        reviews = json.loads(run.get("reviews_json") or "[]")
+    except Exception:
+        reviews = []
+    try:
+        models = json.loads(run.get("models_json") or "[]")
+    except Exception:
+        models = []
+    review_html = "".join(
+        f"<details><summary>{esc(r.get('label'))} · {esc(r.get('lens_name'))}</summary>"
+        f"<pre>{esc(r.get('text'))}</pre></details>" for r in reviews)
+
+    return admin_page("分析详情", f"""
+      <h1>分析详情</h1>
+      <div class="sub">
+        {esc(run['created_at'])} · 访客 <span class="mono">{esc(run['vid'])}</span> ·
+        {esc(run['ip'])} · {esc(short_ua(run['ua'] or ''))} ·
+        用时 {run['duration']}s · 花费 ￥{run['cost']} ·
+        <a href="{base}">← 返回总览</a>
+      </div>
+      <div class="box"><h3>遭遇（过往与当下）</h3><pre>{esc(run['encounter'])}</pre></div>
+      <div class="box"><h3>问题（想要解决）</h3><pre>{esc(run['problem'])}</pre></div>
+      <div class="box"><h3>未来的期待</h3><pre>{esc(run['expectation'])}</pre></div>
+      <div class="box" style="border-color:rgba(139,123,255,.35)">
+        <h3>最终报告</h3><pre>{esc(run['final_text'])}</pre></div>
+      <h2>本次上场的模型（{len(models)}）</h2>
+      <div class="sub">{esc('、'.join(f"{m.get('label')}" for m in models))}</div>
+      <h2>12 份独立意见（点击展开）</h2>
+      {review_html or "<div class='empty'>没有记录（可能已关闭内容记录）</div>"}
+    """)
 
 
 # --------------------------------------------------------------------------
@@ -742,6 +1228,28 @@ EVENT_QUEUE_TIMEOUT = 0.35
 
 PRICE_INDEX = {m["id"]: m for m in MODEL_CATALOG}
 
+# 正在跑 / 刚跑完的任务：手机断线后重新连回来，靠它恢复现场
+JOBS: dict[str, "Job"] = {}
+JOBS_LOCK = threading.Lock()
+JOBS_KEEP = 60          # 最多保留多少个任务
+JOBS_TTL = 60 * 60 * 6  # 任务最多保留 6 小时
+
+
+def register_job(job: "Job") -> None:
+    with JOBS_LOCK:
+        JOBS[job.id] = job
+        if len(JOBS) > JOBS_KEEP:
+            for old_id in sorted(JOBS, key=lambda k: JOBS[k].created)[: len(JOBS) - JOBS_KEEP]:
+                JOBS.pop(old_id, None)
+        now = time.time()
+        for jid in [k for k, j in JOBS.items() if now - j.created > JOBS_TTL]:
+            JOBS.pop(jid, None)
+
+
+def get_job(job_id: str) -> "Job | None":
+    with JOBS_LOCK:
+        return JOBS.get(job_id)
+
 
 def price_of(model_id: str) -> tuple[float, float]:
     item = PRICE_INDEX.get(model_id)
@@ -790,6 +1298,17 @@ class Job:
         self.results: dict[str, dict] = {}
         self.final_text = ""
         self.lock = threading.Lock()
+        self.created = time.time()
+        self.created_at_str = now_str()
+        # 访客标识（由 HTTP 层注入）
+        self.visitor_id = ""
+        self.client_ip = ""
+        self.client_ua = ""
+        self.client_referer = ""
+        # 断线重连用的现场：每张卡片的最新文本、状态，以及总体状态
+        self.subscribers: list[queue.Queue] = []
+        self.cards: dict[str, dict] = {}
+        self.state = {"status": "running", "total": 0, "cost": None, "usage": None}
         self.opener = build_opener(cfg)
         self._reasoning_chars: dict[str, int] = {}
         self._usage_by_key: dict[str, tuple[int, int]] = {}
@@ -809,7 +1328,65 @@ class Job:
             self.usage["calls"] = len(self._usage_by_key)
 
     def emit(self, event: str, **data) -> None:
-        self.q.put({"event": event, **data})
+        payload = {"event": event, **data}
+        with self.lock:
+            self._apply(payload)
+            subs = list(self.subscribers)
+        for q in subs:
+            q.put(payload)
+
+    # -- 现场维护：让新连上来的客户端能补齐所有已生成的内容 ---------------
+    def _apply(self, ev: dict) -> None:
+        e = ev.get("event")
+        key = ev.get("key")
+        if e == "job_start":
+            self.state["total"] = ev.get("total") or 0
+        elif e == "model_start":
+            self.cards.setdefault(key, {
+                "key": key, "label": ev.get("label"), "lens_name": ev.get("lens_name"),
+                "scope": ev.get("scope"), "phase": ev.get("phase"), "text": "",
+                "status": "running", "error": None,
+            })
+        elif e == "delta":
+            card = self.cards.setdefault(key, {
+                "key": key, "label": "", "lens_name": "", "scope": ev.get("scope"),
+                "phase": None, "text": "", "status": "running", "error": None,
+            })
+            card["text"] += ev.get("text") or ""
+        elif e in ("model_done", "lens_done"):
+            card = self.cards.get(key)
+            if card:
+                card["status"] = "done"
+        elif e in ("model_error", "model_timeout"):
+            card = self.cards.get(key)
+            if card:
+                card["status"] = "error"
+                card["error"] = ev.get("message")
+        elif e == "done":
+            self.state.update({"status": "done", "cost": ev.get("cost"), "usage": ev.get("usage")})
+        elif e == "fatal":
+            self.state.update({"status": "error", "error": ev.get("message")})
+        elif e == "__close__":
+            if self.state["status"] == "running":
+                self.state["status"] = "done"
+            self.state["finished"] = True
+
+    def subscribe(self) -> tuple["queue.Queue", dict]:
+        q: "queue.Queue[dict]" = queue.Queue()
+        with self.lock:
+            self.subscribers.append(q)
+            snap = {
+                "event": "snapshot", "job_id": self.id, "state": dict(self.state),
+                "cards": [dict(c) for c in self.cards.values()],
+                "parts": self.parts,
+                "aggregator": self.aggregator,
+            }
+        return q, snap
+
+    def unsubscribe(self, q: "queue.Queue") -> None:
+        with self.lock:
+            if q in self.subscribers:
+                self.subscribers.remove(q)
 
     # -- 单模型调用 ------------------------------------------------------
     def _run_one(self, model: dict, lens: dict, messages: list, scope: str, phase: str = "round1",
@@ -1011,8 +1588,16 @@ class Job:
             self.save_history()
             self.cost = estimate_usage_cost(self.usage, self.models, self.aggregator)
             self.emit("done", job_id=self.id, usage=self.usage, cost=round(self.cost, 4))
+            try:
+                record_run(self, time.time() - self.created, "done")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[warn] 统计写入失败：{exc}")
         except Exception as exc:  # noqa: BLE001
             self.emit("fatal", message=f"{type(exc).__name__}: {exc}")
+            try:
+                record_run(self, time.time() - self.created, "error")
+            except Exception:
+                pass
         finally:
             self.emit("__close__")
 
@@ -1043,9 +1628,49 @@ class Job:
 class Handler(BaseHTTPRequestHandler):
     server_version = "MPA/1.0"
     protocol_version = "HTTP/1.1"
+    cfg_cache = None
 
     def log_message(self, fmt, *args):  # 静音
         pass
+
+    # -- 鉴权 --------------------------------------------------------------
+    def _cfg(self) -> dict:
+        return load_config()
+
+    def _is_authed(self, cfg: dict) -> bool:
+        if not auth_enabled(cfg):
+            return True
+        cookie = self.headers.get("Cookie") or ""
+        for part in cookie.split(";"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                if k.strip() == COOKIE_NAME:
+                    return hmac.compare_digest(v.strip(), auth_token(cfg))
+        return False
+
+    def _deny(self) -> None:
+        if self.path.startswith("/api/"):
+            return self._send_json({"error": "unauthorized", "need_login": True}, 401)
+        body = LOGIN_PAGE.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _guard(self) -> bool:
+        """返回 True 表示已放行；返回 False 表示已经回写了拒绝响应。"""
+        path = self.path.split("?")[0]
+        if (path in ("/api/login", "/manifest.webmanifest", "/sw.js", "/static/sw.js")
+                or path.startswith("/static/icons/") or path == "/favicon.ico"):
+            # PWA 图标与清单必须能匿名访问，否则「添加到主屏幕」时拿不到图标
+            return True
+        cfg = self._cfg()
+        if self._is_authed(cfg):
+            return True
+        self._deny()
+        return False
 
     # -- 工具 ------------------------------------------------------------
     def _send_json(self, obj, status: int = 200) -> None:
@@ -1054,6 +1679,78 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self._cookie_header()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _cookie_header(self) -> None:
+        """第一次访问时给浏览器发一个匿名访客 ID，用来区分不同的人。"""
+        if getattr(self, "_new_vid", None):
+            self.send_header(
+                "Set-Cookie",
+                f"{VISITOR_COOKIE}={self._new_vid}; Path=/; Max-Age={60*60*24*400}; SameSite=Lax")
+
+    def _visitor_id(self) -> str:
+        cookie = self.headers.get("Cookie") or ""
+        for part in cookie.split(";"):
+            if "=" in part:
+                k, v = part.split("=", 1)
+                if k.strip() == VISITOR_COOKIE and v.strip():
+                    return v.strip()
+        self._new_vid = secrets.token_hex(6)
+        return self._new_vid
+
+    def _send_html(self, html: str, status: int = 200) -> None:
+        body = html.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self._cookie_header()
+        self.end_headers()
+        self.wfile.write(body)
+
+    # -- 后台统计 ----------------------------------------------------------
+    def _admin(self, path: str) -> None:
+        cfg = self._cfg()
+        token = stats_config(cfg)["admin_token"]
+        parts = [p for p in path.split("/") if p]  # ["admin", token, ...]
+        if len(parts) < 2 or not hmac.compare_digest(parts[1], token):
+            return self._send_html(ADMIN_404, 404)
+        rest = parts[2:]
+        if not rest:
+            return self._send_html(admin_dashboard())
+        if rest[0] == "run" and len(rest) > 1:
+            run = get_run(rest[1])
+            return self._send_html(admin_run_detail(run) if run else ADMIN_404, 200 if run else 404)
+        if rest[0] == "visitor" and len(rest) > 1:
+            return self._send_html(admin_visitor(rest[1]))
+        if rest[0] == "export.json":
+            return self._send_json({"overview": stats_overview(),
+                                    "visitors": list_visitors(1000),
+                                    "runs": [{**r, "reviews_json": json.loads(r["reviews_json"] or "[]")}
+                                             for r in list_runs(1000)]})
+        if rest[0] == "export.csv":
+            return self._send_csv()
+        self._send_html(ADMIN_404, 404)
+
+    def _send_csv(self) -> None:
+        import csv as _csv
+        import io as _io
+        buf = _io.StringIO()
+        w = _csv.writer(buf)
+        w.writerow(["时间", "访客ID", "IP", "设备", "用时(秒)", "花费(元)", "状态",
+                    "遭遇", "问题", "期待", "最终报告"])
+        for r in list_runs(5000):
+            w.writerow([r["created_at"], r["vid"], r["ip"], short_ua(r["ua"] or ""),
+                        r["duration"], r["cost"], r["status"],
+                        r["encounter"], r["problem"], r["expectation"],
+                        (r["final_text"] or "")])
+        body = ("\ufeff" + buf.getvalue()).encode("utf-8")  # BOM 让 Excel 正确识别中文
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", 'attachment; filename="mpa-runs.csv"')
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
@@ -1080,14 +1777,29 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self._cookie_header()
         self.end_headers()
         self.wfile.write(body)
 
     # -- 路由 ------------------------------------------------------------
     def do_GET(self):  # noqa: N802
+        if not self._guard():
+            return
         path = self.path.split("?")[0]
         if path in ("/", "/index.html"):
+            vid = self._visitor_id()
+            try:
+                touch_visitor(vid, client_ip_of(self), self.headers.get("User-Agent", ""), "/")
+            except Exception:
+                pass
             return self._serve_static("index.html")
+        if path.startswith("/admin"):
+            return self._admin(path)
+        if path == "/manifest.webmanifest":
+            return self._serve_static("manifest.webmanifest")
+        if path == "/sw.js":
+            # Service Worker 必须从根路径提供，作用域才能覆盖整个站点
+            return self._serve_static("sw.js")
         if path.startswith("/static/"):
             return self._serve_static(path[len("/static/"):])
         if path == "/api/meta":
@@ -1106,6 +1818,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(public_config(load_config()))
         if path == "/api/version":
             return self._send_json({"version": build_version()})
+        if path.startswith("/api/job/"):
+            rest = path[len("/api/job/"):]
+            if rest.endswith("/stream"):
+                return self._stream_job(rest[: -len("/stream")])
+            job = get_job(rest)
+            if not job:
+                return self._send_json({"error": "任务不存在或已过期"}, 404)
+            q, snap = job.subscribe()
+            job.unsubscribe(q)
+            return self._send_json(snap)
         if path == "/api/draw":
             query = self.path.split("?", 1)[1] if "?" in self.path else ""
             count = 12
@@ -1137,6 +1859,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_DELETE(self):  # noqa: N802
+        if not self._guard():
+            return
         path = self.path.split("?")[0]
         if path.startswith("/api/history/"):
             hid = path.rsplit("/", 1)[-1]
@@ -1149,6 +1873,28 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):  # noqa: N802
         path = self.path.split("?")[0]
         try:
+            if path == "/api/login":
+                payload = self._read_json()
+                cfg = load_config()
+                if not auth_enabled(cfg):
+                    return self._send_json({"ok": True, "note": "未设置密码"})
+                if hmac.compare_digest(str(payload.get("password") or ""),
+                                       (cfg["access"].get("password") or "")):
+                    token = auth_token(cfg)
+                    body = json.dumps({"ok": True}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.send_header("Set-Cookie",
+                                     f"{COOKIE_NAME}={token}; Path=/; Max-Age={60*60*24*90}; SameSite=Lax; HttpOnly")
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                return self._send_json({"ok": False, "error": "密码错误"}, 401)
+
+            if not self._guard():
+                return
+
             if path == "/api/config":
                 payload = self._read_json()
                 cfg = load_config()
@@ -1172,6 +1918,8 @@ class Handler(BaseHTTPRequestHandler):
                         if payload["network"].get(k) is not None:
                             net[k] = payload["network"][k]
                     apply_network_options(cfg)
+                if isinstance(payload.get("access"), dict) and payload["access"].get("password") is not None:
+                    cfg.setdefault("access", {})["password"] = str(payload["access"]["password"])
                 save_config(cfg)
                 return self._send_json({"ok": True, "config": public_config(cfg)})
 
@@ -1188,15 +1936,47 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/run":
                 payload = self._read_json()
                 cfg = load_config()
-                return self._run_job(payload, cfg)
+                apply_network_options(cfg)
+                st = stats_config(cfg)
+                vid = self._visitor_id()
+                # 防止被刷：每人每小时次数上限 + 全站每日花费上限
+                per_hour = int(st.get("per_visitor_hourly") or 0)
+                if per_hour and runs_last_hour(vid) >= per_hour:
+                    return self._send_json(
+                        {"error": f"每人每小时最多分析 {per_hour} 次，休息一会儿再来吧"}, 429)
+                cap = float(st.get("daily_cost_cap") or 0)
+                if cap and cost_today() >= cap:
+                    return self._send_json(
+                        {"error": "今天的额度已经用完了，明天再来吧"}, 429)
+                job = Job(payload, cfg)
+                job.visitor_id = vid
+                job.client_ip = client_ip_of(self)
+                job.client_ua = self.headers.get("User-Agent", "")
+                job.client_referer = self.headers.get("Referer", "")
+                register_job(job)
+                threading.Thread(target=job.run, daemon=True).start()
+                return self._send_json({"job_id": job.id, "ok": True})
+
+            if path.startswith("/api/job/") and path.endswith("/stop"):
+                job = get_job(path[len("/api/job/"): -len("/stop")])
+                if not job:
+                    return self._send_json({"error": "任务不存在"}, 404)
+                job.stop_event.set()
+                return self._send_json({"ok": True})
         except UpstreamError as exc:
             return self._send_json({"error": str(exc)}, 400)
         except Exception as exc:  # noqa: BLE001
             return self._send_json({"error": f"{type(exc).__name__}: {exc}"}, 500)
         self.send_error(404)
 
-    def _run_job(self, payload: dict, cfg: dict) -> None:
-        job = Job(payload, cfg)
+    def _stream_job(self, job_id: str) -> None:
+        """SSE：先把当前现场（快照）发给客户端，再持续推增量。
+        手机锁屏断线后重新连上同一个任务，就能补齐全部内容。"""
+        job = get_job(job_id)
+        if not job:
+            return self._send_json({"error": "任务不存在或已过期"}, 404)
+
+        q, snap = job.subscribe()
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache, no-transform")
@@ -1204,14 +1984,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
 
-        worker = threading.Thread(target=job.run, daemon=True)
-        worker.start()
         try:
+            self.wfile.write(f"data: {json.dumps(snap, ensure_ascii=False)}\n\n".encode("utf-8"))
+            self.wfile.flush()
             while True:
                 try:
-                    ev = job.q.get(timeout=EVENT_QUEUE_TIMEOUT)
+                    ev = q.get(timeout=EVENT_QUEUE_TIMEOUT)
                 except queue.Empty:
-                    if not worker.is_alive() and job.q.empty():
+                    if job.state.get("finished") and q.empty():
                         break
                     self.wfile.write(b": keep-alive\n\n")
                     self.wfile.flush()
@@ -1222,9 +2002,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
-            job.stop_event.set()
+            pass  # 客户端断开了（手机锁屏就是这种情况），任务继续在后台跑
         finally:
-            worker.join(timeout=2)
+            job.unsubscribe(q)
 
 
 def main() -> None:
@@ -1233,6 +2013,8 @@ def main() -> None:
     if not CONFIG_PATH.exists():
         save_config(cfg)
     apply_network_options(cfg)
+    init_stats_db()
+    st = stats_config(cfg)
     port = int(os.environ.get("MPA_PORT", "8765"))
     host = os.environ.get("MPA_HOST", "127.0.0.1")
     url = f"http://{host}:{port}/"
@@ -1247,6 +2029,8 @@ def main() -> None:
     net = cfg.get("network") or {}
     print(f"  网络：   {'强制 IPv4' if net.get('force_ipv4', True) else '自动'} · "
           f"代理 {net.get('proxy') or '未设置'}")
+    print(f"  密码：   {'已开启' if auth_enabled(cfg) else '未设置（任何人拿到网址都能用）'}")
+    print(f"  统计后台： {url}admin/{st['admin_token']}")
     print("  停止： 按 Control + C")
     print("=" * 62)
     if os.environ.get("MPA_NO_BROWSER") != "1":

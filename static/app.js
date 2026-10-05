@@ -10,6 +10,8 @@ const state = {
   aggregator: null,
   drawn: [],
   running: false,
+  jobId: null,
+  es: null,
   controller: null,
   cards: new Map(),
   order: [],
@@ -130,7 +132,7 @@ async function boot() {
 
   // 先绑定事件，保证界面可交互；再逐步初始化，任何一步失败都不影响其它部分
   bindEvents();
-  for (const step of [drawRound, updateKeyStatus]) {
+  for (const step of [resumeJob, drawRound, updateKeyStatus]) {
     try {
       await step();
     } catch (err) {
@@ -236,6 +238,8 @@ function resetStage() {
   state.order = [];
   state.finalText = "";
   state.reviews = [];
+  state.jobId = null;
+  if (state.es) { state.es.close(); state.es = null; }
   $("#stage").innerHTML = "";
   $("#btn-copy").disabled = true;
   $("#btn-export").disabled = true;
@@ -317,7 +321,7 @@ async function run() {
   $("#btn-run").disabled = true;
   $("#btn-stop").hidden = false;
   $("#progress").hidden = false;
-  $("#stage-sub").textContent = "圆桌进行中……每个模型独立作答，完成后由总分析师收敛。";
+  $("#stage-sub").textContent = "已提交，正在分配任务……";
 
   // 汇总模型固定用配置里的（默认 Qwen3-30B-A3B，实测最快）
   const aggregator = state.config?.aggregator || {
@@ -337,48 +341,129 @@ async function run() {
   };
 
   try {
-    const resp = await fetch("/api/run", {
+    const res = await fetch("/api/run", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
       signal: state.controller.signal,
-    });
-    if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`);
-    await readStream(resp.body);
+    }).then((r) => r.json());
+    if (!res.job_id) throw new Error(res.error || "提交失败");
+    // 记住任务号：手机锁屏、切走、甚至关掉页面，回来都还能接着看
+    state.jobId = res.job_id;
+    localStorage.setItem("mpa_job", res.job_id);
+    $("#stage-sub").textContent = "圆桌进行中……每个模型独立作答，完成后由总分析师收敛。";
+    openStream(res.job_id);
   } catch (err) {
     if (err.name !== "AbortError") toast("出错了：" + err.message, 4000);
   } finally {
-    state.running = false;
-    $("#btn-run").disabled = false;
-    $("#btn-stop").hidden = true;
-    state.cards.forEach((c, k) => {
-      c.running = false;
-      c.ended = c.ended || performance.now();
-      c.dirty = true;
-      paint(k);
-    });
-    updateProgress();
+    if (!state.jobId) finishRunUI();
   }
 }
 
-async function readStream(body) {
-  const reader = body.getReader();
-  const decoder = new TextDecoder("utf-8");
-  let buf = "";
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const chunks = buf.split("\n\n");
-    buf = chunks.pop();
-    for (const chunk of chunks) {
-      const line = chunk.split("\n").find((l) => l.startsWith("data:"));
-      if (!line) continue;
-      let ev;
-      try { ev = JSON.parse(line.slice(5).trim()); } catch { continue; }
-      handleEvent(ev);
+function finishRunUI() {
+  state.running = false;
+  $("#btn-run").disabled = false;
+  $("#btn-stop").hidden = true;
+  state.cards.forEach((c, k) => {
+    c.running = false;
+    c.ended = c.ended || performance.now();
+    c.dirty = true;
+    paint(k);
+  });
+  updateProgress();
+}
+
+/* 用 EventSource 订阅任务：断线它会自己重连，重连时服务端会先发一份现场快照，
+   所以手机锁屏几分钟再回来，内容会自动补齐。 */
+function openStream(jobId) {
+  if (state.es) state.es.close();
+  const es = new EventSource(`/api/job/${jobId}/stream`);
+  state.es = es;
+  es.onmessage = (msg) => {
+    let ev;
+    try { ev = JSON.parse(msg.data); } catch { return; }
+    if (ev.event === "snapshot") return applySnapshot(ev);
+    handleEvent(ev);
+  };
+  es.onerror = () => {
+    if (state.running) {
+      $("#stage-sub").textContent = "连接中断，正在自动重连……（后台仍在继续分析）";
     }
+  };
+}
+
+/* 用服务端的现场重建整个界面（重连 / 刷新页面 / 换设备都用它） */
+function applySnapshot(snap) {
+  const stage = $("#stage");
+  stage.innerHTML = "";
+  state.cards = new Map();
+  state.order = [];
+  (snap.cards || []).forEach((c) => {
+    const isFinal = c.scope === "final";
+    const isMerge = c.scope === "lens";
+    const card = makeCard(c.key, {
+      title: isFinal ? `最终分析 · ${c.label}` : c.label,
+      lens: isFinal ? "总分析师" : (isMerge ? "视角综述" : c.lens_name),
+      sub: c.status === "done" ? "已作答" : c.status === "error" ? "失败" : "生成中…",
+      isFinal,
+    });
+    card.text = c.text || "";
+    card.dirty = true;
+    if (c.status === "done") {
+      card.running = false; card.ended = performance.now();
+      card.status.className = "status done";
+      card.status.textContent = isFinal ? "完成" : "已作答";
+    } else if (c.status === "error") {
+      card.running = false; card.ended = performance.now();
+      card.el.classList.add("error");
+      card.status.className = "status err";
+      card.status.textContent = "失败";
+      if (c.error) card.body.innerHTML = `<p>${esc(c.error)}</p>`;
+    } else {
+      card.running = true;
+    }
+    if (isFinal) stage.prepend(card.el);
+    else if (isMerge) stage.insertBefore(card.el, stage.querySelector(".mcard.final") || null);
+    else stage.appendChild(card.el);
+    paint(c.key);
+  });
+  if (snap.state?.total) {
+    $("#stage-sub").textContent = snap.state.status === "done"
+      ? "分析已完成"
+      : `共 ${snap.state.total} 份独立意见（模型 × 视角）正在生成……`;
   }
+  updateProgress();
+  if (snap.state?.status && snap.state.status !== "running") finishRunUI();
+}
+
+/* 页面加载时看看有没有没跑完的任务 */
+async function resumeJob() {
+  const jobId = localStorage.getItem("mpa_job");
+  if (!jobId) return;
+  try {
+    const snap = await fetch(`/api/job/${jobId}`).then((r) => r.json());
+    if (snap.error) { localStorage.removeItem("mpa_job"); return; }
+    state.jobId = jobId;
+    state.running = snap.state?.status === "running";
+    if (snap.parts) {
+      $("#in-encounter").value = snap.parts.encounter || "";
+      $("#in-problem").value = snap.parts.problem || "";
+      $("#in-expectation").value = snap.parts.expectation || "";
+      $$("textarea").forEach((t) => t.dispatchEvent(new Event("input")));
+    }
+    applySnapshot(snap);
+    if (state.running) {
+      $("#btn-run").disabled = true;
+      $("#btn-stop").hidden = false;
+      $("#progress").hidden = false;
+      toast("已恢复上次未完成的分析");
+      openStream(jobId);
+    } else {
+      $("#btn-copy").disabled = false;
+      $("#btn-export").disabled = false;
+      localStorage.removeItem("mpa_job");
+    }
+  } catch { /* 忽略 */ }
 }
 
 function handleEvent(ev) {
@@ -472,6 +557,9 @@ function handleEvent(ev) {
           extra = ` · 实际花费约 ￥${Number(ev.cost || 0).toFixed(3)}（${t} tokens）`;
         }
         $("#stage-sub").textContent = `完成 · 共 ${state.cards.size} 张卡片${extra}`;
+        localStorage.removeItem("mpa_job");
+        if (state.es) { state.es.close(); state.es = null; }
+        finishRunUI();
       }
       $("#btn-copy").disabled = false;
       $("#btn-export").disabled = false;
@@ -568,11 +656,14 @@ function bindEvents() {
 
   $("#btn-run").addEventListener("click", run);
   $("#btn-stop").addEventListener("click", () => {
-    state.controller?.abort();
+    // 通知服务端停下这个任务，并断开本页面的订阅
+    if (state.jobId) fetch(`/api/job/${state.jobId}/stop`, { method: "POST" }).catch(() => {});
+    if (state.es) { state.es.close(); state.es = null; }
+    localStorage.removeItem("mpa_job");
+    state.running = false;
     toast("已停止");
     $("#btn-stop").hidden = true;
     $("#btn-run").disabled = false;
-    state.running = false;
   });
   $("#btn-redraw").addEventListener("click", async () => {
     await drawRound();
@@ -588,6 +679,11 @@ function bindEvents() {
 }
 
 boot().catch((e) => toast("初始化失败：" + e.message, 6000));
+
+// 注册 Service Worker：让「添加到主屏幕」后能全屏打开（https 或 localhost 下才生效）
+if ("serviceWorker" in navigator && (location.protocol === "https:" || location.hostname === "localhost" || location.hostname === "127.0.0.1")) {
+  navigator.serviceWorker.register("/sw.js").catch(() => {});
+}
 
 // 兜底：任何未捕获的错误都显示出来，避免页面看起来"卡住了"
 window.addEventListener("error", (e) => {

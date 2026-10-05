@@ -26,6 +26,17 @@ body{
   font-size:14.5px;
   line-height:1.72;
   -webkit-font-smoothing:antialiased;
+  /* iPhone 刘海屏 / 底部横条安全区 */
+  padding-top:env(safe-area-inset-top);
+  padding-left:env(safe-area-inset-left);
+  padding-right:env(safe-area-inset-right);
+  padding-bottom:env(safe-area-inset-bottom);
+  overscroll-behavior-y:none;
+}
+
+/* 从主屏图标打开（全屏模式）时留出顶部空间 */
+@media (display-mode: standalone){
+  .topbar{padding-top:calc(14px + env(safe-area-inset-top))}
 }
 
 .aurora{position:fixed;inset:0;overflow:hidden;z-index:0;pointer-events:none}
